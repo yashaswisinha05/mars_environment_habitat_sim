@@ -190,3 +190,35 @@ Compiles saved frame folders into high-quality MP4 videos. By default, it will l
   * `--input`: Recording directory. If omitted, uses the latest folder matching `mars_teleop_out*`.
   * `--fps`: Target frames per second (defaults to `15`).
   * `--rgb-out` / `--depth-out`: Path to write output MP4 files. Defaults to `<input_folder>/rgb_video.mp4` and `<input_folder>/depth_video.mp4`.
+
+---
+
+### 5. NavDP Policy Rollout
+
+#### `rollout_navdp_policy.py`
+Runs a trained NavDP/S2DiT route policy inside the Mars terrain scene. The Mars scene does not contain semantic object masks, so this adapter projects a world-space target point into the camera as a synthetic green goal mask, feeds RGB-D-derived policy inputs to the NavDP checkpoint, executes the predicted velocity action, and saves frames, `rollout.npz`, `manifest.json`, and an optional MP4.
+
+Typical usage:
+
+```bash
+python rollout_navdp_policy.py \
+  --navdp-root /path/to/navdp_sam \
+  --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
+  --goal-x 8 --goal-z -8 \
+  --out mars_navdp_rollout \
+  --device cuda \
+  --sample-steps 20 \
+  --zero-lateral
+```
+
+Useful options:
+
+- `--scene`: Mars GLB path. Defaults to `marsyard2022_tri.glb` beside the script.
+- `--terrain-height-mode auto`: uses a heightmap if provided, otherwise samples `marsyard2022.obj`, otherwise falls back to flat height.
+- `--heightmap`: optional original terrain heightmap if available.
+- `--goal-x`, `--goal-z`: target location on the Mars terrain.
+- `--goal-radius`: pixel radius for the synthetic projected goal mask.
+- `--obstacle-mode none|depth`: keep obstacle masks empty, or create a simple depth-threshold obstacle mask for experiments.
+- `--cbf`: optionally apply the NavDP cone/project CBF correction when an obstacle mask is present.
+
+This is the cleanest bridge between the Mars renderer here and the policy code in `navdp_sam`: keep the simulator assets in this repo, keep the policy/checkpoint in NavDP, and connect them with `--navdp-root`.
