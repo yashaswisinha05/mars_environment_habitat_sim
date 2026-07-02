@@ -424,6 +424,13 @@ def main() -> None:
     ap.add_argument("--out", default="mars_navdp_rollout")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--weights", choices=["model", "ema"], default="model")
+    # Compatibility knobs matching scripts/rollout_habitat_policy.py. The Mars
+    # adapter is a single-scene rollout, so scene/category generator flags are
+    # accepted for copy-paste but do not spawn Habitat generator episodes.
+    ap.add_argument("--scene-mode", default="mars", help="Accepted for NavDP command compatibility; ignored by Mars adapter.")
+    ap.add_argument("--obstacle-pool", default="none", help="Accepted for NavDP command compatibility; ignored unless ghost/depth obstacles are provided.")
+    ap.add_argument("--categories", nargs="*", default=["chair"], help="Accepted for command compatibility; the Mars target is set by --goal-x/--goal-z.")
+    ap.add_argument("--episodes-per-category", type=int, default=1, help="Accepted for command compatibility; Mars adapter runs one rollout.")
     ap.add_argument("--sample-steps", type=int, default=20)
     ap.add_argument("--image-size", type=int, default=None)
     ap.add_argument("--height", type=int, default=720)
@@ -482,6 +489,18 @@ def main() -> None:
     ap.add_argument("--cbf-proj-lr", type=float, default=0.08)
     ap.add_argument("--cbf-cone-margin", type=float, default=0.05)
     ap.add_argument("--cbf-trust", type=float, default=0.3)
+    ap.add_argument("--cbf-smooth", type=float, default=0.0)
+    ap.add_argument("--cbf-keep-speed", type=float, default=1.0)
+    ap.add_argument("--cbf-metric", choices=["euclidean", "mahalanobis"], default="euclidean")
+    ap.add_argument("--cbf-cov-base", type=float, default=1.0)
+    ap.add_argument("--cbf-cov-growth", type=float, default=0.6)
+    ap.add_argument("--cbf-cov-mode", choices=["grow", "flat", "shrink"], default="shrink")
+    ap.add_argument("--cbf-radius-mode", choices=["fixed", "perceived"], default="fixed")
+    ap.add_argument("--robot-radius", type=float, default=0.25)
+    ap.add_argument("--safety-margin", type=float, default=0.15)
+    ap.add_argument("--ghost-obstacle-world-radius", type=float, default=0.25)
+    ap.add_argument("--lost-goal-ghost", action="store_true", help="Accepted for command compatibility; Mars goal is already rendered as a ghost mask.")
+    ap.add_argument("--replan-every", type=int, default=1, help="Sample a fresh diffusion chunk every N control ticks.")
     ap.add_argument("--save-every", type=int, default=1)
     ap.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
@@ -490,7 +509,13 @@ def main() -> None:
     add_navdp_to_path(navdp_root)
 
     from navdp.data.habitat_route_dataset import _empty_belief_tensor, _proprio_from_pose
-    from navdp.extensions import DepthObstacleMap, nearest_obstacle_point, project_chunk_cone, project_forward_velocity_cbf
+    from navdp.extensions import (
+        DepthObstacleMap,
+        horizon_growth_covariance,
+        nearest_obstacle_point,
+        project_chunk_cone,
+        project_forward_velocity_cbf,
+    )
     from rollout_habitat_policy import ActionSmoother, action_to_control, frame_to_spatial, load_model, resolve_modes, resolve_obstacle_channel
 
     out_dir = Path(args.out).expanduser().resolve()
@@ -553,6 +578,9 @@ def main() -> None:
     ]}
     video_frames = []
     prev_obstacle_point = None
+    last_pred_chunk = None
+    chunk_len = 0
+    replan_every = max(int(args.replan_every), 1)
     cbf_active = 0
 
     print("Mars NavDP rollout", flush=True)
@@ -561,6 +589,13 @@ def main() -> None:
     print(f"  ckpt       : {Path(args.ckpt).expanduser().resolve()}", flush=True)
     print(f"  terrain    : {terrain.mode}", flush=True)
     print(f"  goal       : x={goal[0]:.2f} y={goal[1]:.2f} z={goal[2]:.2f}", flush=True)
+    if args.scene_mode != "mars" or args.obstacle_pool != "none" or args.episodes_per_category != 1:
+        print(
+            "  compat    : scene/category generator flags were accepted but Mars runs one explicit scene",
+            flush=True,
+        )
+    if args.lost_goal_ghost:
+        print("  ghost     : --lost-goal-ghost accepted; Mars goal mask is already a projected ghost", flush=True)
     if ghost_obstacle is not None:
         print(
             f"  obstacle   : ghost x={ghost_obstacle[0]:.2f} "
@@ -626,59 +661,90 @@ def main() -> None:
             route_index = torch.zeros(1, dtype=torch.long, device=device)
             active_goal_index = torch.zeros(1, dtype=torch.long, device=device)
 
-            pred = model.sample(
-                spatial,
-                proprio_t,
-                steps=int(args.sample_steps),
-                belief_tensor=belief_t,
-                obstacle_map=obstacle_t,
-                route_index=route_index,
-                active_goal_index=active_goal_index,
-            )
-
             obstacle_point = None
             if args.cbf and int(obstacle_mask.sum()) > 0:
                 obstacle_point = ghost_obstacle_point
                 if obstacle_point is None:
                     obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
-                if obstacle_point is not None:
+
+            do_replan = (step % replan_every == 0) or (last_pred_chunk is None)
+            if do_replan:
+                pred = model.sample(
+                    spatial,
+                    proprio_t,
+                    steps=int(args.sample_steps),
+                    belief_tensor=belief_t,
+                    obstacle_map=obstacle_t,
+                    route_index=route_index,
+                    active_goal_index=active_goal_index,
+                )
+
+                if args.cbf and args.cbf_mode == "cone" and obstacle_point is not None:
                     cbf_active += 1
                     v_o = np.zeros(2, dtype=np.float32)
-                    if args.cbf_mode == "cone":
-                        if args.zero_lateral and pred.shape[-1] >= 3:
-                            pred = pred.clone()
-                            pred[..., 1] = 0.0
-                        p_lat = float(obstacle_point[1])
-                        side = -1.0 if p_lat > 0.0 else 1.0
-                        pred = project_chunk_cone(
-                            pred,
-                            obstacle_point,
-                            v_o,
-                            r=args.cbf_d_safe,
-                            dt=dt,
-                            vel_scale=1.0,
-                            iters=args.cbf_proj_iters,
-                            lr=args.cbf_proj_lr,
-                            trust=args.cbf_trust,
-                            margin=args.cbf_cone_margin,
-                            deadzone_range=args.cbf_d_safe + args.cbf_deadzone,
-                            side=side,
+                    if args.zero_lateral and pred.shape[-1] >= 3:
+                        pred = pred.clone()
+                        pred[..., 1] = 0.0
+                    p_lat = float(obstacle_point[1])
+                    side = -1.0 if p_lat > 0.0 else 1.0
+                    cone_sigma = None
+                    if args.cbf_metric == "mahalanobis":
+                        cone_sigma = horizon_growth_covariance(
+                            pred.shape[1],
+                            pred.shape[2],
+                            base=args.cbf_cov_base,
+                            growth=args.cbf_cov_growth,
+                            mode=args.cbf_cov_mode,
+                            device=pred.device,
+                            dtype=pred.dtype,
                         )
+                    if args.cbf_radius_mode == "perceived" and ghost_obstacle is not None:
+                        r_used = args.ghost_obstacle_world_radius + args.robot_radius + args.safety_margin
+                    else:
+                        r_used = args.cbf_d_safe
+                    pred = project_chunk_cone(
+                        pred,
+                        obstacle_point,
+                        v_o,
+                        r=r_used,
+                        dt=dt,
+                        vel_scale=1.0,
+                        iters=args.cbf_proj_iters,
+                        lr=args.cbf_proj_lr,
+                        trust=args.cbf_trust,
+                        margin=args.cbf_cone_margin,
+                        smooth_weight=args.cbf_smooth,
+                        keep_speed=args.cbf_keep_speed,
+                        sigma=cone_sigma,
+                        deadzone_range=r_used + args.cbf_deadzone,
+                        side=side,
+                    )
                     prev_obstacle_point = obstacle_point
+
+                pred_chunk = pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
+                chunk_ctrl = np.stack([
+                    action_to_control(
+                        a,
+                        action_mode=modes["action_mode"],
+                        max_forward_speed=args.max_forward_speed,
+                        max_lateral_speed=args.max_lateral_speed,
+                        max_yaw_rate=args.max_yaw_rate,
+                    )
+                    for a in pred_chunk
+                ]).astype(np.float32)
+                smoother.add(step, chunk_ctrl)
+                last_pred_chunk = pred_chunk
+                chunk_len = int(pred_chunk.shape[0])
+                if step == 0 and replan_every > chunk_len:
+                    print(
+                        f"[WARN] --replan-every {replan_every} > chunk length {chunk_len}; "
+                        "actions will repeat after the buffer runs dry.",
+                        flush=True,
+                    )
+            else:
+                pred_chunk = last_pred_chunk
             _ = prev_obstacle_point
 
-            pred_chunk = pred.squeeze(0).detach().cpu().numpy().astype(np.float32)
-            chunk_ctrl = np.stack([
-                action_to_control(
-                    a,
-                    action_mode=modes["action_mode"],
-                    max_forward_speed=args.max_forward_speed,
-                    max_lateral_speed=args.max_lateral_speed,
-                    max_yaw_rate=args.max_yaw_rate,
-                )
-                for a in pred_chunk
-            ]).astype(np.float32)
-            smoother.add(step, chunk_ctrl)
             action_3d = smoother.get(step)
             if args.zero_lateral and action_3d.shape[0] >= 2:
                 action_3d = action_3d.copy()
@@ -776,7 +842,11 @@ def main() -> None:
         "ckpt": str(Path(args.ckpt).expanduser().resolve()),
         "scene": str(Path(args.scene).expanduser().resolve()),
         "terrain_mode": terrain.mode,
+        "replan_every": replan_every,
         "cbf_active": cbf_active,
+        "cbf_metric": args.cbf_metric,
+        "cbf_cov_mode": args.cbf_cov_mode,
+        "cbf_radius_mode": args.cbf_radius_mode,
         "npz": str(npz_path),
     }
     with (out_dir / "manifest.json").open("w", encoding="utf-8") as f:

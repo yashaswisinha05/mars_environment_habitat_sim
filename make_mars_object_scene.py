@@ -1,15 +1,12 @@
-"""make_mars_object_scene.py - add simple chair/cup meshes to the Mars terrain.
+"""make_mars_object_scene.py - add simple object meshes to the Mars terrain.
 
 The original terrain OBJ is written by hm2obj.py as x / row-axis / height. This
 script rewrites it into a Habitat-friendly Y-up OBJ (x / height / z) and appends
-simple procedural objects:
-
-  * a chair-shaped goal mesh
-  * a cup-shaped obstacle mesh
+a simple procedural chair mesh by default. A cup obstacle can be added only when
+requested with --with-cup.
 
 The resulting OBJ can be passed to rollout_navdp_policy.py via --scene while the
-same world coordinates are passed as --goal-x/--goal-z and
---ghost-obstacle-x/--ghost-obstacle-z.
+chair world coordinate is passed as --goal-x/--goal-z for the ghost goal mask.
 """
 from __future__ import annotations
 
@@ -24,7 +21,7 @@ from typing import Iterable, Sequence, Tuple
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_TERRAIN_OBJ = HERE / "marsyard2022.obj"
-DEFAULT_OUT_OBJ = HERE / "marsyard2022_chair_cup.obj"
+DEFAULT_OUT_OBJ = HERE / "marsyard2022_chair.obj"
 
 
 class ObjWriter:
@@ -237,7 +234,13 @@ illum 2
             src = src_mtl.parent / tex
             dst = out_mtl.parent / tex
             if src.exists() and src.resolve() != dst.resolve():
-                shutil.copy2(src, dst)
+                try:
+                    if not dst.exists():
+                        shutil.copy2(src, dst)
+                except PermissionError:
+                    # Another smoke/run may already be copying the same large texture.
+                    # The OBJ/MTL remain valid as long as the file exists by load time.
+                    pass
 
 
 def write_scene(
@@ -252,10 +255,11 @@ def write_scene(
     cup_yaw: float,
     chair_scale: float,
     cup_scale: float,
+    include_cup: bool,
 ) -> dict:
     xs, zs, grid, vertex_count = parse_terrain_grid(terrain_obj)
     chair_ground = terrain_height(xs, zs, grid, chair_x, chair_z)
-    cup_ground = terrain_height(xs, zs, grid, cup_x, cup_z)
+    cup_ground = terrain_height(xs, zs, grid, cup_x, cup_z) if include_cup else None
     out_obj.parent.mkdir(parents=True, exist_ok=True)
     out_mtl = out_obj.with_suffix(".mtl")
     src_mtl = terrain_obj.with_suffix(".mtl")
@@ -278,19 +282,20 @@ def write_scene(
             fout.write(line)
 
         add_chair(writer, chair_x, chair_ground, chair_z, math.radians(chair_yaw), chair_scale)
-        add_cup(writer, cup_x, cup_ground, cup_z, math.radians(cup_yaw), cup_scale)
+        if include_cup and cup_ground is not None:
+            add_cup(writer, cup_x, cup_ground, cup_z, math.radians(cup_yaw), cup_scale)
         fout.writelines(writer.lines)
 
     return {
         "out_obj": str(out_obj),
         "out_mtl": str(out_mtl),
         "chair": {"x": chair_x, "y": chair_ground, "z": chair_z},
-        "cup": {"x": cup_x, "y": cup_ground, "z": cup_z},
+        "cup": ({"x": cup_x, "y": cup_ground, "z": cup_z} if include_cup and cup_ground is not None else None),
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Create a Mars terrain scene with a chair goal and cup obstacle.")
+    ap = argparse.ArgumentParser(description="Create a Mars terrain scene with a chair goal and optional cup obstacle.")
     ap.add_argument("--terrain-obj", default=str(DEFAULT_TERRAIN_OBJ))
     ap.add_argument("--out", default=str(DEFAULT_OUT_OBJ))
     ap.add_argument("--chair-x", type=float, default=8.0)
@@ -301,6 +306,7 @@ def main() -> None:
     ap.add_argument("--cup-yaw-deg", type=float, default=0.0)
     ap.add_argument("--chair-scale", type=float, default=1.25)
     ap.add_argument("--cup-scale", type=float, default=1.8)
+    ap.add_argument("--with-cup", action="store_true", help="Add the cup obstacle mesh. Default is chair-only / no obstacle.")
     args = ap.parse_args()
 
     result = write_scene(
@@ -314,19 +320,28 @@ def main() -> None:
         cup_yaw=float(args.cup_yaw_deg),
         chair_scale=float(args.chair_scale),
         cup_scale=float(args.cup_scale),
+        include_cup=bool(args.with_cup),
     )
     print("Wrote Mars object scene:")
     print("  OBJ:", result["out_obj"])
     print("  MTL:", result["out_mtl"])
     print("  chair:", result["chair"])
-    print("  cup:", result["cup"])
+    if result["cup"] is not None:
+        print("  cup:", result["cup"])
     print("\nRollout example:")
-    print(
+    cmd = (
         "python rollout_navdp_policy.py --scene "
         f"{Path(result['out_obj']).name} --terrain-obj marsyard2022.obj "
         f"--goal-x {args.chair_x:g} --goal-z {args.chair_z:g} "
-        f"--ghost-obstacle-x {args.cup_x:g} --ghost-obstacle-z {args.cup_z:g} --cbf"
+        "--habitat-use-obstacle-channel --sample-steps 30 --action-smoothing ensemble "
+        "--cbf --cbf-mode cone --zero-lateral --cbf-metric mahalanobis "
+        "--cbf-cov-mode shrink --cbf-radius-mode perceived --robot-radius 0.25 "
+        "--safety-margin 0.15 --cbf-proj-iters 40 --cbf-keep-speed 1.0 "
+        "--lost-goal-ghost --replan-every 3"
     )
+    if result["cup"] is not None:
+        cmd += f" --ghost-obstacle-x {args.cup_x:g} --ghost-obstacle-z {args.cup_z:g}"
+    print(cmd)
 
 
 if __name__ == "__main__":

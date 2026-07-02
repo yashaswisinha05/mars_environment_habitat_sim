@@ -205,7 +205,6 @@ python rollout_navdp_policy.py \
   --navdp-root /path/to/navdp_sam \
   --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
   --goal-x 8 --goal-z -8 \
-  --ghost-obstacle-x 3 --ghost-obstacle-z -1 \
   --out mars_navdp_rollout \
   --device cuda \
   --sample-steps 20 \
@@ -220,45 +219,50 @@ Useful options:
 - `--heightmap`: optional original terrain heightmap if available.
 - `--goal-x`, `--goal-z`: ghost target location on the Mars terrain; rendered into the goal-mask channel.
 - `--goal-radius`: pixel radius for the synthetic projected goal mask.
-- `--ghost-obstacle-x`, `--ghost-obstacle-z`: optional ghost obstacle location; rendered into the obstacle-mask channel and painted into the obstacle map.
-- `--ghost-obstacle-radius`: pixel radius for the synthetic projected obstacle mask.
-- `--obstacle-mode none|depth`: keep obstacle masks synthetic-only/empty, or add a simple depth-threshold obstacle mask for experiments.
-- `--cbf`: optionally apply NavDP cone/project CBF. For a ghost obstacle, CBF uses the obstacle world point directly in robot-relative coordinates.
+- `--obstacle-mode none|depth`: default `none` keeps obstacle masks empty; `depth` is only for later experiments.
+- `--cbf`: accepted for command compatibility. With no obstacle mask, CBF stays inactive.
 
 
 #### `make_mars_object_scene.py`
-Creates a real mesh scene with a chair-shaped goal object and cup-shaped obstacle object placed on the Mars terrain. The script rewrites the terrain OBJ into Habitat's Y-up convention and appends procedural chair/cup geometry, so the camera actually sees objects instead of only ghost masks.
+Creates a real mesh scene with a chair-shaped goal object placed on the Mars terrain. By default this is **obstacle-free**: no cup mesh, no obstacle mask, and no obstacle map entry. Pass `--with-cup` only when you deliberately want a visible cup obstacle.
 
-Generate the default chair/cup scenario:
+Generate the default chair-only scenario:
 
 ```bash
 python make_mars_object_scene.py \
-  --out marsyard2022_chair_cup.obj \
-  --chair-x 8 --chair-z -8 \
-  --cup-x 5 --cup-z 2
+  --out marsyard2022_chair.obj \
+  --chair-x 8 --chair-z -8
 ```
 
-Then run the policy against the generated scene, while passing the same coordinates as the ghost goal and ghost obstacle masks:
+Then run the policy against the generated scene. The chair is visible in RGB, while `--goal-x/--goal-z` renders the matching ghost goal mask for the mask-conditioned policy. No `--ghost-obstacle-*` flags are passed, so there is no obstacle.
 
 ```bash
 python rollout_navdp_policy.py \
   --navdp-root /path/to/navdp_sam \
   --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
-  --scene marsyard2022_chair_cup.obj \
+  --scene marsyard2022_chair.obj \
   --terrain-obj marsyard2022.obj \
   --goal-x 8 --goal-z -8 \
-  --ghost-obstacle-x 5 --ghost-obstacle-z 2 \
-  --out mars_chair_cup_rollout \
-  --device cuda \
-  --sample-steps 20 \
-  --zero-lateral \
-  --cbf
+  --device cuda --habitat-use-obstacle-channel \
+  --sample-steps 30 --action-smoothing ensemble \
+  --cbf --cbf-mode cone --zero-lateral \
+  --cbf-metric mahalanobis --cbf-cov-mode shrink \
+  --cbf-radius-mode perceived --robot-radius 0.25 --safety-margin 0.15 \
+  --cbf-proj-iters 40 --cbf-keep-speed 1.0 \
+  --lost-goal-ghost --replan-every 3 \
+  --out mars_chair_no_obstacle_rollout
 ```
+
+Notes on those copied Habitat flags:
+
+- `--habitat-use-obstacle-channel` keeps the checkpoint input shape compatible, even though the obstacle channel is all zeros.
+- `--cbf` is harmless here; with no obstacle mask or ghost obstacle, CBF has nothing to project against.
+- `--lost-goal-ghost` is accepted, but Mars already uses a projected ghost goal mask as the target.
 
 If your HabitatSim build does not load OBJ scenes directly, convert the generated OBJ to GLB with the existing Blender converter:
 
 ```bash
-blender --background --python obj2glb.py -- marsyard2022_chair_cup.obj marsyard2022_chair_cup.glb
+blender --background --python obj2glb.py -- marsyard2022_chair.obj marsyard2022_chair.glb
 ```
 
 This is the cleanest bridge between the Mars renderer here and the policy code in `navdp_sam`: keep the simulator assets in this repo, keep the policy/checkpoint in NavDP, and connect them with `--navdp-root`.
