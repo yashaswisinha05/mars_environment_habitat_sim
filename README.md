@@ -225,4 +225,40 @@ Useful options:
 - `--obstacle-mode none|depth`: keep obstacle masks synthetic-only/empty, or add a simple depth-threshold obstacle mask for experiments.
 - `--cbf`: optionally apply NavDP cone/project CBF. For a ghost obstacle, CBF uses the obstacle world point directly in robot-relative coordinates.
 
+
+#### `make_mars_object_scene.py`
+Creates a real mesh scene with a chair-shaped goal object and cup-shaped obstacle object placed on the Mars terrain. The script rewrites the terrain OBJ into Habitat's Y-up convention and appends procedural chair/cup geometry, so the camera actually sees objects instead of only ghost masks.
+
+Generate the default chair/cup scenario:
+
+```bash
+python make_mars_object_scene.py \
+  --out marsyard2022_chair_cup.obj \
+  --chair-x 8 --chair-z -8 \
+  --cup-x 5 --cup-z 2
+```
+
+Then run the policy against the generated scene, while passing the same coordinates as the ghost goal and ghost obstacle masks:
+
+```bash
+python rollout_navdp_policy.py \
+  --navdp-root /path/to/navdp_sam \
+  --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
+  --scene marsyard2022_chair_cup.obj \
+  --terrain-obj marsyard2022.obj \
+  --goal-x 8 --goal-z -8 \
+  --ghost-obstacle-x 5 --ghost-obstacle-z 2 \
+  --out mars_chair_cup_rollout \
+  --device cuda \
+  --sample-steps 20 \
+  --zero-lateral \
+  --cbf
+```
+
+If your HabitatSim build does not load OBJ scenes directly, convert the generated OBJ to GLB with the existing Blender converter:
+
+```bash
+blender --background --python obj2glb.py -- marsyard2022_chair_cup.obj marsyard2022_chair_cup.glb
+```
+
 This is the cleanest bridge between the Mars renderer here and the policy code in `navdp_sam`: keep the simulator assets in this repo, keep the policy/checkpoint in NavDP, and connect them with `--navdp-root`.
