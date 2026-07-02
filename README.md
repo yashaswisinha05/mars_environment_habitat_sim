@@ -205,10 +205,12 @@ python rollout_navdp_policy.py \
   --navdp-root /path/to/navdp_sam \
   --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
   --goal-x 8 --goal-z -8 \
+  --ghost-obstacle-x 3 --ghost-obstacle-z -1 \
   --out mars_navdp_rollout \
   --device cuda \
   --sample-steps 20 \
-  --zero-lateral
+  --zero-lateral \
+  --cbf
 ```
 
 Useful options:
@@ -216,9 +218,11 @@ Useful options:
 - `--scene`: Mars GLB path. Defaults to `marsyard2022_tri.glb` beside the script.
 - `--terrain-height-mode auto`: uses a heightmap if provided, otherwise samples `marsyard2022.obj`, otherwise falls back to flat height.
 - `--heightmap`: optional original terrain heightmap if available.
-- `--goal-x`, `--goal-z`: target location on the Mars terrain.
+- `--goal-x`, `--goal-z`: ghost target location on the Mars terrain; rendered into the goal-mask channel.
 - `--goal-radius`: pixel radius for the synthetic projected goal mask.
-- `--obstacle-mode none|depth`: keep obstacle masks empty, or create a simple depth-threshold obstacle mask for experiments.
-- `--cbf`: optionally apply the NavDP cone/project CBF correction when an obstacle mask is present.
+- `--ghost-obstacle-x`, `--ghost-obstacle-z`: optional ghost obstacle location; rendered into the obstacle-mask channel and painted into the obstacle map.
+- `--ghost-obstacle-radius`: pixel radius for the synthetic projected obstacle mask.
+- `--obstacle-mode none|depth`: keep obstacle masks synthetic-only/empty, or add a simple depth-threshold obstacle mask for experiments.
+- `--cbf`: optionally apply NavDP cone/project CBF. For a ghost obstacle, CBF uses the obstacle world point directly in robot-relative coordinates.
 
 This is the cleanest bridge between the Mars renderer here and the policy code in `navdp_sam`: keep the simulator assets in this repo, keep the policy/checkpoint in NavDP, and connect them with `--navdp-root`.

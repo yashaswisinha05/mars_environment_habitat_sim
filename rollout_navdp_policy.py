@@ -348,6 +348,38 @@ def project_goal_mask(
     }
 
 
+def obstacle_point_from_world(obstacle: np.ndarray, position: np.ndarray, yaw: float) -> Optional[np.ndarray]:
+    right, _up, forward = camera_coords(obstacle, position, yaw)
+    if forward <= 0.05:
+        return None
+    # CBF helpers use robot-frame [x_forward, y_left].
+    return np.asarray([forward, -right], dtype=np.float32)
+
+
+def paint_obstacle_map_point(
+    obstacle_map: np.ndarray,
+    builder,
+    point_forward_left: Optional[np.ndarray],
+    radius_cells: int,
+) -> np.ndarray:
+    out = np.asarray(obstacle_map, dtype=np.float32).copy()
+    if point_forward_left is None:
+        return out
+    p = np.asarray(point_forward_left, dtype=np.float32).reshape(-1)
+    if p.size < 2 or not np.isfinite(p[:2]).all():
+        return out
+    rows, cols = builder.world_to_grid(np.asarray([p[0]], dtype=np.float32), np.asarray([p[1]], dtype=np.float32))
+    r = int(rows[0])
+    c = int(cols[0])
+    rad = max(int(radius_cells), 0)
+    h, w = out.shape
+    for rr in range(max(0, r - rad), min(h, r + rad + 1)):
+        for cc in range(max(0, c - rad), min(w, c + rad + 1)):
+            if (rr - r) ** 2 + (cc - c) ** 2 <= rad ** 2:
+                out[rr, cc] = 1.0
+    return out
+
+
 def depth_obstacle_mask(depth: np.ndarray, threshold: float, min_y_frac: float) -> np.ndarray:
     arr = np.asarray(depth, dtype=np.float32)
     h, _ = arr.shape
@@ -427,6 +459,13 @@ def main() -> None:
     ap.add_argument("--obstacle-mode", choices=["none", "depth"], default="none")
     ap.add_argument("--obstacle-depth-threshold", type=float, default=1.4)
     ap.add_argument("--obstacle-min-y-frac", type=float, default=0.45)
+    ap.add_argument("--ghost-obstacle-x", type=float, default=None, help="Optional world X for a synthetic/ghost obstacle mask.")
+    ap.add_argument("--ghost-obstacle-z", type=float, default=None, help="Optional world Z for a synthetic/ghost obstacle mask.")
+    ap.add_argument("--ghost-obstacle-y", type=float, default=None, help="World Y of ghost obstacle marker; default terrain height + ghost-obstacle-height.")
+    ap.add_argument("--ghost-obstacle-height", type=float, default=0.45)
+    ap.add_argument("--ghost-obstacle-radius", type=int, default=24, help="Pixel radius for the synthetic obstacle mask.")
+    ap.add_argument("--ghost-obstacle-map-radius", type=int, default=4, help="Radius in 96x96 obstacle-map cells for the ghost obstacle.")
+    ap.add_argument("--no-clamp-obstacle-to-edge", action="store_true")
     ap.add_argument("--zero-lateral", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--max-forward-speed", type=float, default=1.0)
     ap.add_argument("--max-lateral-speed", type=float, default=1.0)
@@ -495,9 +534,22 @@ def main() -> None:
         goal_y = terrain(float(args.goal_x), float(args.goal_z)) + float(args.goal_height)
     goal = np.asarray([float(args.goal_x), float(goal_y), float(args.goal_z)], dtype=np.float32)
 
+    ghost_obstacle = None
+    if (args.ghost_obstacle_x is None) != (args.ghost_obstacle_z is None):
+        raise ValueError("pass both --ghost-obstacle-x and --ghost-obstacle-z, or neither")
+    if args.ghost_obstacle_x is not None and args.ghost_obstacle_z is not None:
+        obstacle_y = args.ghost_obstacle_y
+        if obstacle_y is None:
+            obstacle_y = terrain(float(args.ghost_obstacle_x), float(args.ghost_obstacle_z)) + float(args.ghost_obstacle_height)
+        ghost_obstacle = np.asarray(
+            [float(args.ghost_obstacle_x), float(obstacle_y), float(args.ghost_obstacle_z)],
+            dtype=np.float32,
+        )
+
     rows = {k: [] for k in [
         "rgb", "depth", "goal_mask", "obstacle_mask", "seg_masks", "pose", "proprio",
         "action_3d", "pred_chunk", "goal_visible_pixels", "goal_u", "goal_v", "goal_distance",
+        "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance",
     ]}
     video_frames = []
     prev_obstacle_point = None
@@ -509,6 +561,12 @@ def main() -> None:
     print(f"  ckpt       : {Path(args.ckpt).expanduser().resolve()}", flush=True)
     print(f"  terrain    : {terrain.mode}", flush=True)
     print(f"  goal       : x={goal[0]:.2f} y={goal[1]:.2f} z={goal[2]:.2f}", flush=True)
+    if ghost_obstacle is not None:
+        print(
+            f"  obstacle   : ghost x={ghost_obstacle[0]:.2f} "
+            f"y={ghost_obstacle[1]:.2f} z={ghost_obstacle[2]:.2f}",
+            flush=True,
+        )
     print(f"  modes      : action={modes['action_mode']} proprio={modes['proprio_mode']} obstacle_channel={use_obstacle_channel}", flush=True)
 
     try:
@@ -533,8 +591,31 @@ def main() -> None:
             else:
                 obstacle_mask = np.zeros_like(goal_mask, dtype=np.uint8)
 
+            ghost_obstacle_mask = np.zeros_like(goal_mask, dtype=np.uint8)
+            obstacle_info = {"u": -1.0, "v": -1.0, "range": float("nan"), "visible": 0.0}
+            ghost_obstacle_point = None
+            if ghost_obstacle is not None:
+                ghost_obstacle_mask, obstacle_info = project_goal_mask(
+                    goal=ghost_obstacle,
+                    position=position,
+                    yaw=yaw,
+                    height=rgb.shape[0],
+                    width=rgb.shape[1],
+                    hfov_deg=args.hfov_deg,
+                    radius=args.ghost_obstacle_radius,
+                    clamp_to_edge=not args.no_clamp_obstacle_to_edge,
+                )
+                ghost_obstacle_point = obstacle_point_from_world(ghost_obstacle, position, yaw)
+                obstacle_mask = np.maximum(obstacle_mask, ghost_obstacle_mask).astype(np.uint8)
+
             spatial = frame_to_spatial(depth, goal_mask, image_size, obstacle_mask, include_obstacle_channel=use_obstacle_channel).to(device)
             obstacle_map = obstacle_builder.build(depth) if args.obstacle_mode == "depth" else np.zeros((96, 96), dtype=np.float32)
+            obstacle_map = paint_obstacle_map_point(
+                obstacle_map,
+                obstacle_builder,
+                ghost_obstacle_point,
+                args.ghost_obstacle_map_radius,
+            )
             obstacle_t = torch.from_numpy(obstacle_map[None]).float().to(device)
 
             qx, qy, qz, qw = yaw_quat_xyzw(yaw)
@@ -557,7 +638,9 @@ def main() -> None:
 
             obstacle_point = None
             if args.cbf and int(obstacle_mask.sum()) > 0:
-                obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
+                obstacle_point = ghost_obstacle_point
+                if obstacle_point is None:
+                    obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
                 if obstacle_point is not None:
                     cbf_active += 1
                     v_o = np.zeros(2, dtype=np.float32)
@@ -634,9 +717,13 @@ def main() -> None:
             rows["goal_u"].append(float(goal_info["u"]))
             rows["goal_v"].append(float(goal_info["v"]))
             rows["goal_distance"].append(goal_dist)
+            rows["obstacle_visible_pixels"].append(int(obstacle_mask.sum()))
+            rows["obstacle_u"].append(float(obstacle_info["u"]))
+            rows["obstacle_v"].append(float(obstacle_info["v"]))
+            rows["obstacle_distance"].append(float(obstacle_info["range"]))
 
             if step % max(int(args.save_every), 1) == 0:
-                text = f"t={step} dist={goal_dist:.2f} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}"
+                text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}"
                 frame = overlay_frame(rgb, goal_mask, obstacle_mask, text)
                 frame.save(frame_dir / f"frame_{step:04d}.png")
                 video_frames.append(frame)
@@ -644,6 +731,7 @@ def main() -> None:
             if step % 10 == 0:
                 print(
                     f"step {step:04d} | dist={goal_dist:.2f} | goal_px={int(goal_mask.sum())} "
+                    f"| obs_px={int(obstacle_mask.sum())} "
                     f"| action=[{action_3d[0]:.2f},{action_3d[1]:.2f},{action_3d[2]:.2f}]",
                     flush=True,
                 )
@@ -670,7 +758,12 @@ def main() -> None:
         goal_u=np.asarray(rows["goal_u"], dtype=np.float32),
         goal_v=np.asarray(rows["goal_v"], dtype=np.float32),
         goal_distance=np.asarray(rows["goal_distance"], dtype=np.float32),
+        obstacle_visible_pixels=np.asarray(rows["obstacle_visible_pixels"], dtype=np.int32),
+        obstacle_u=np.asarray(rows["obstacle_u"], dtype=np.float32),
+        obstacle_v=np.asarray(rows["obstacle_v"], dtype=np.float32),
+        obstacle_distance=np.asarray(rows["obstacle_distance"], dtype=np.float32),
         goal_position=goal.astype(np.float32),
+        obstacle_position=(ghost_obstacle.astype(np.float32) if ghost_obstacle is not None else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)),
         success=np.asarray(success, dtype=bool),
         hz=np.asarray(float(args.hz), dtype=np.float32),
     )
@@ -679,6 +772,7 @@ def main() -> None:
         "frames": len(rows["rgb"]),
         "final_distance": float(rows["goal_distance"][-1]) if rows["goal_distance"] else None,
         "goal_position": goal.tolist(),
+        "ghost_obstacle_position": ghost_obstacle.tolist() if ghost_obstacle is not None else None,
         "ckpt": str(Path(args.ckpt).expanduser().resolve()),
         "scene": str(Path(args.scene).expanduser().resolve()),
         "terrain_mode": terrain.mode,
