@@ -259,10 +259,46 @@ Notes on those copied Habitat flags:
 - `--cbf` is harmless here; with no obstacle mask or ghost obstacle, CBF has nothing to project against.
 - `--lost-goal-ghost` is accepted, but Mars already uses a projected ghost goal mask as the target.
 
+#### `make_mars_rock_scene.py`
+Creates a Mars scene with two real procedural rocks baked into the OBJ: a green goal rock and a red obstacle rock. The rocks are visible in RGB and depth, while `rollout_navdp_policy.py` still uses the matching world coordinates to project the policy's goal and obstacle masks.
+
+```bash
+python make_mars_rock_scene.py \
+  --out marsyard2022_rocks.obj \
+  --goal-x 8 --goal-z -8 \
+  --obstacle-x 4 --obstacle-z 0
+```
+
+Run the policy with the green rock as the target and the red rock as the CBF/policy obstacle:
+
+```bash
+python rollout_navdp_policy.py \
+  --navdp-root /path/to/navdp_sam \
+  --ckpt /path/to/navdp_sam/runs/habitat_route_belief_s2_obstacle4_single_action3d/ckpt_last.pt \
+  --scene marsyard2022_rocks.obj \
+  --terrain-obj marsyard2022.obj \
+  --goal-x 8 --goal-z -8 \
+  --ghost-obstacle-x 4 --ghost-obstacle-z 0 \
+  --device cuda --habitat-use-obstacle-channel \
+  --sample-steps 30 --action-smoothing ensemble \
+  --scene-height-flip-z --clearance 1.4 --pose-terrain-radius 0.8 \
+  --goal-height 1.2 --goal-terrain-radius 0.8 \
+  --lost-goal-ghost \
+  --cbf --cbf-mode cone --zero-lateral \
+  --cbf-metric mahalanobis --cbf-cov-mode shrink \
+  --cbf-radius-mode perceived --robot-radius 0.25 --safety-margin 0.15 \
+  --cbf-proj-iters 40 --cbf-keep-speed 1.0 \
+  --out mars_rocks_rollout
+```
+
 If your HabitatSim build does not load OBJ scenes directly, convert the generated OBJ to GLB with the existing Blender converter:
 
 ```bash
+# chair scene
 blender --background --python obj2glb.py -- marsyard2022_chair.obj marsyard2022_chair.glb
+
+# rock scene
+blender --background --python obj2glb.py -- marsyard2022_rocks.obj marsyard2022_rocks.glb
 ```
 
 This is the cleanest bridge between the Mars renderer here and the policy code in `navdp_sam`: keep the simulator assets in this repo, keep the policy/checkpoint in NavDP, and connect them with `--navdp-root`.
