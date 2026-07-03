@@ -499,7 +499,10 @@ def main() -> None:
     ap.add_argument("--robot-radius", type=float, default=0.25)
     ap.add_argument("--safety-margin", type=float, default=0.15)
     ap.add_argument("--ghost-obstacle-world-radius", type=float, default=0.25)
-    ap.add_argument("--lost-goal-ghost", action="store_true", help="Accepted for command compatibility; Mars goal is already rendered as a ghost mask.")
+    ap.add_argument("--lost-goal-ghost", action="store_true", help="Turn back toward the known ghost goal when its projected mask is lost.")
+    ap.add_argument("--lost-goal-min-px", type=int, default=10, help="Goal-mask pixels below this count trigger lost-goal recovery.")
+    ap.add_argument("--lost-goal-turn-kp", type=float, default=1.4)
+    ap.add_argument("--lost-goal-forward", type=float, default=0.0, help="Forward speed during lost-goal recovery; default rotates in place.")
     ap.add_argument("--replan-every", type=int, default=1, help="Sample a fresh diffusion chunk every N control ticks.")
     ap.add_argument("--save-every", type=int, default=1)
     ap.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
@@ -595,7 +598,11 @@ def main() -> None:
             flush=True,
         )
     if args.lost_goal_ghost:
-        print("  ghost     : --lost-goal-ghost accepted; Mars goal mask is already a projected ghost", flush=True)
+        print(
+            f"  ghost     : lost-goal recovery enabled min_px={args.lost_goal_min_px} "
+            f"turn_kp={args.lost_goal_turn_kp:g} forward={args.lost_goal_forward:g}",
+            flush=True,
+        )
     if ghost_obstacle is not None:
         print(
             f"  obstacle   : ghost x={ghost_obstacle[0]:.2f} "
@@ -746,6 +753,15 @@ def main() -> None:
             _ = prev_obstacle_point
 
             action_3d = smoother.get(step)
+            goal_lost = int(goal_mask.sum()) < int(args.lost_goal_min_px)
+            if args.lost_goal_ghost and goal_lost:
+                bearing = planar_goal_bearing(position, yaw, goal)
+                yaw_cmd = float(np.clip(
+                    float(args.lost_goal_turn_kp) * bearing,
+                    -float(args.max_yaw_rate),
+                    float(args.max_yaw_rate),
+                ))
+                action_3d = np.asarray([float(args.lost_goal_forward), 0.0, yaw_cmd], dtype=np.float32)
             if args.zero_lateral and action_3d.shape[0] >= 2:
                 action_3d = action_3d.copy()
                 action_3d[1] = 0.0
@@ -789,7 +805,8 @@ def main() -> None:
             rows["obstacle_distance"].append(float(obstacle_info["range"]))
 
             if step % max(int(args.save_every), 1) == 0:
-                text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}"
+                lost_txt = " LOST" if int(goal_mask.sum()) < int(args.lost_goal_min_px) else ""
+                text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}{lost_txt}"
                 frame = overlay_frame(rgb, goal_mask, obstacle_mask, text)
                 frame.save(frame_dir / f"frame_{step:04d}.png")
                 video_frames.append(frame)
@@ -855,6 +872,13 @@ def main() -> None:
         save_video(video_frames, out_dir / "rollout.mp4", fps=max(float(args.hz) / max(int(args.save_every), 1), 1.0))
     print(f"Saved rollout: {npz_path}", flush=True)
     print(f"Output dir   : {out_dir}", flush=True)
+
+
+def planar_goal_bearing(position: np.ndarray, yaw: float, goal: np.ndarray) -> float:
+    dx = float(goal[0] - position[0])
+    dz = float(goal[2] - position[2])
+    desired_yaw = math.atan2(-dx, -dz)
+    return wrap_angle(desired_yaw - float(yaw))
 
 
 def integrate_mars(position: np.ndarray, yaw: float, action_3d: np.ndarray, dt: float) -> Tuple[np.ndarray, float]:
