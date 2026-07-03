@@ -522,6 +522,7 @@ def main() -> None:
     ap.add_argument("--ensemble-decay", type=float, default=0.5)
     ap.add_argument("--ema-alpha", type=float, default=0.6)
     ap.add_argument("--cbf", action="store_true")
+    ap.add_argument("--cbf-active-range", type=float, default=0.0, help="Only apply CBF when obstacle forward distance is within this range; <=0 means always active.")
     ap.add_argument("--cbf-mode", choices=["project", "cone"], default="cone")
     ap.add_argument("--cbf-d-safe", type=float, default=0.75)
     ap.add_argument("--cbf-gamma", type=float, default=0.3)
@@ -540,6 +541,14 @@ def main() -> None:
     ap.add_argument("--robot-radius", type=float, default=0.25)
     ap.add_argument("--safety-margin", type=float, default=0.15)
     ap.add_argument("--ghost-obstacle-world-radius", type=float, default=0.25)
+    ap.add_argument("--ghost-obstacle-bypass", action=argparse.BooleanOptionalAction, default=True, help="When a ghost obstacle blocks the goal cone, steer around it before handing back to the policy.")
+    ap.add_argument("--ghost-obstacle-bypass-range", type=float, default=10.0)
+    ap.add_argument("--ghost-obstacle-bypass-clearance", type=float, default=1.6)
+    ap.add_argument("--ghost-obstacle-bypass-forward", type=float, default=0.45)
+    ap.add_argument("--ghost-obstacle-bypass-kp", type=float, default=1.2)
+    ap.add_argument("--ghost-obstacle-bypass-fov-deg", type=float, default=65.0)
+    ap.add_argument("--ghost-obstacle-bypass-goal-cone-deg", type=float, default=45.0)
+    ap.add_argument("--ghost-obstacle-bypass-side", choices=["auto", "left", "right"], default="auto")
     ap.add_argument("--lost-goal-ghost", action="store_true", help="Turn back toward the known ghost goal when its projected mask is lost.")
     ap.add_argument("--lost-goal-min-px", type=int, default=10, help="Goal-mask pixels below this count trigger lost-goal recovery.")
     ap.add_argument("--lost-goal-turn-kp", type=float, default=1.4)
@@ -624,7 +633,7 @@ def main() -> None:
     rows = {k: [] for k in [
         "rgb", "depth", "goal_mask", "obstacle_mask", "seg_masks", "pose", "proprio",
         "action_3d", "pred_chunk", "goal_visible_pixels", "goal_u", "goal_v", "goal_distance",
-        "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance",
+        "obstacle_visible_pixels", "obstacle_u", "obstacle_v", "obstacle_distance", "bypass_active",
     ]}
     video_frames = []
     prev_obstacle_point = None
@@ -632,6 +641,7 @@ def main() -> None:
     chunk_len = 0
     replan_every = max(int(args.replan_every), 1)
     cbf_active = 0
+    bypass_active_steps = 0
 
     print("Mars NavDP rollout", flush=True)
     print(f"  navdp_root : {navdp_root}", flush=True)
@@ -660,6 +670,12 @@ def main() -> None:
             f"y={ghost_obstacle[1]:.2f} z={ghost_obstacle[2]:.2f}",
             flush=True,
         )
+        if args.ghost_obstacle_bypass:
+            print(
+                f"  bypass    : enabled range={args.ghost_obstacle_bypass_range:g}m "
+                f"clearance={args.ghost_obstacle_bypass_clearance:g}m side={args.ghost_obstacle_bypass_side}",
+                flush=True,
+            )
     print(f"  modes      : action={modes['action_mode']} proprio={modes['proprio_mode']} obstacle_channel={use_obstacle_channel}", flush=True)
 
     try:
@@ -724,6 +740,13 @@ def main() -> None:
                 obstacle_point = ghost_obstacle_point
                 if obstacle_point is None:
                     obstacle_point = nearest_obstacle_point(obstacle_mask, depth, intr)
+            cbf_obstacle_point = obstacle_point
+            if (
+                cbf_obstacle_point is not None
+                and float(args.cbf_active_range) > 0.0
+                and float(cbf_obstacle_point[0]) > float(args.cbf_active_range)
+            ):
+                cbf_obstacle_point = None
 
             do_replan = (step % replan_every == 0) or (last_pred_chunk is None)
             if do_replan:
@@ -737,12 +760,13 @@ def main() -> None:
                     active_goal_index=active_goal_index,
                 )
 
-                if args.cbf and args.cbf_mode == "cone" and obstacle_point is not None:
+                if args.cbf and args.cbf_mode == "cone" and cbf_obstacle_point is not None:
                     cbf_active += 1
                     v_o = np.zeros(2, dtype=np.float32)
                     if args.zero_lateral and pred.shape[-1] >= 3:
                         pred = pred.clone()
                         pred[..., 1] = 0.0
+                    obstacle_point = cbf_obstacle_point
                     p_lat = float(obstacle_point[1])
                     side = -1.0 if p_lat > 0.0 else 1.0
                     cone_sigma = None
@@ -813,13 +837,27 @@ def main() -> None:
                     float(args.max_yaw_rate),
                 ))
                 action_3d = np.asarray([float(args.lost_goal_forward), 0.0, yaw_cmd], dtype=np.float32)
+            bypass_active = False
+            if args.ghost_obstacle_bypass and ghost_obstacle is not None and obstacle_point is not None:
+                bypass_active, bypass_action = ghost_obstacle_bypass_action(
+                    position=position,
+                    yaw=yaw,
+                    goal=goal,
+                    obstacle_point=obstacle_point,
+                    max_forward_speed=float(args.max_forward_speed),
+                    max_yaw_rate=float(args.max_yaw_rate),
+                    args=args,
+                )
+                if bypass_active:
+                    action_3d = bypass_action
+                    bypass_active_steps += 1
             if args.zero_lateral and action_3d.shape[0] >= 2:
                 action_3d = action_3d.copy()
                 action_3d[1] = 0.0
-            if args.cbf and args.cbf_mode == "project" and obstacle_point is not None:
+            if args.cbf and args.cbf_mode == "project" and cbf_obstacle_point is not None:
                 action_3d, _ = project_forward_velocity_cbf(
                     action_3d,
-                    obstacle_point,
+                    cbf_obstacle_point,
                     np.zeros(2, dtype=np.float32),
                     d_safe=args.cbf_d_safe,
                     gamma=args.cbf_gamma,
@@ -854,10 +892,12 @@ def main() -> None:
             rows["obstacle_u"].append(float(obstacle_info["u"]))
             rows["obstacle_v"].append(float(obstacle_info["v"]))
             rows["obstacle_distance"].append(float(obstacle_info["range"]))
+            rows["bypass_active"].append(bool(bypass_active))
 
             if step % max(int(args.save_every), 1) == 0:
                 lost_txt = " LOST" if int(goal_mask.sum()) < int(args.lost_goal_min_px) else ""
-                text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}{lost_txt}"
+                bypass_txt = " BYPASS" if bypass_active else ""
+                text = f"t={step} dist={goal_dist:.2f} obs={int(obstacle_mask.sum())} v={action_3d[0]:.2f} yaw={math.degrees(yaw):.1f}{lost_txt}{bypass_txt}"
                 frame = overlay_frame(rgb, goal_mask, obstacle_mask, text)
                 frame.save(frame_dir / f"frame_{step:04d}.png")
                 video_frames.append(frame)
@@ -866,7 +906,8 @@ def main() -> None:
                 print(
                     f"step {step:04d} | dist={goal_dist:.2f} | goal_px={int(goal_mask.sum())} "
                     f"| obs_px={int(obstacle_mask.sum())} "
-                    f"| action=[{action_3d[0]:.2f},{action_3d[1]:.2f},{action_3d[2]:.2f}]",
+                    f"| action=[{action_3d[0]:.2f},{action_3d[1]:.2f},{action_3d[2]:.2f}]"
+                    f" | bypass={int(bypass_active)}",
                     flush=True,
                 )
             if goal_dist <= float(args.stop_dist):
@@ -896,6 +937,7 @@ def main() -> None:
         obstacle_u=np.asarray(rows["obstacle_u"], dtype=np.float32),
         obstacle_v=np.asarray(rows["obstacle_v"], dtype=np.float32),
         obstacle_distance=np.asarray(rows["obstacle_distance"], dtype=np.float32),
+        bypass_active=np.asarray(rows["bypass_active"], dtype=bool),
         goal_position=goal.astype(np.float32),
         obstacle_position=(ghost_obstacle.astype(np.float32) if ghost_obstacle is not None else np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)),
         success=np.asarray(success, dtype=bool),
@@ -919,6 +961,8 @@ def main() -> None:
         "goal_terrain_radius": float(args.goal_terrain_radius),
         "replan_every": replan_every,
         "cbf_active": cbf_active,
+        "bypass_active_steps": bypass_active_steps,
+        "ghost_obstacle_bypass": bool(args.ghost_obstacle_bypass),
         "cbf_metric": args.cbf_metric,
         "cbf_cov_mode": args.cbf_cov_mode,
         "cbf_radius_mode": args.cbf_radius_mode,
@@ -932,6 +976,65 @@ def main() -> None:
     print(f"Output dir   : {out_dir}", flush=True)
 
 
+def ghost_obstacle_bypass_action(
+    *,
+    position: np.ndarray,
+    yaw: float,
+    goal: np.ndarray,
+    obstacle_point: np.ndarray,
+    max_forward_speed: float,
+    max_yaw_rate: float,
+    args,
+) -> Tuple[bool, np.ndarray]:
+    p = np.asarray(obstacle_point, dtype=np.float32).reshape(-1)
+    if p.size < 2 or not np.isfinite(p[:2]).all():
+        return False, np.zeros(3, dtype=np.float32)
+    obs_forward = float(p[0])
+    obs_left = float(p[1])
+    if obs_forward <= 0.05 or obs_forward > float(args.ghost_obstacle_bypass_range):
+        return False, np.zeros(3, dtype=np.float32)
+
+    obs_bearing = math.atan2(obs_left, max(obs_forward, 1e-6))
+    if abs(obs_bearing) > math.radians(float(args.ghost_obstacle_bypass_fov_deg)):
+        return False, np.zeros(3, dtype=np.float32)
+
+    goal_bearing = planar_goal_bearing(position, yaw, goal)
+    goal_range = float(np.linalg.norm(goal[[0, 2]] - np.asarray(position[[0, 2]], dtype=np.float32)))
+    obs_range = float(math.hypot(obs_forward, obs_left))
+    if obs_range >= goal_range - max(0.2, float(args.ghost_obstacle_world_radius)):
+        return False, np.zeros(3, dtype=np.float32)
+
+    bearing_gap = wrap_angle(goal_bearing - obs_bearing)
+    if abs(bearing_gap) > math.radians(float(args.ghost_obstacle_bypass_goal_cone_deg)):
+        return False, np.zeros(3, dtype=np.float32)
+
+    if args.ghost_obstacle_bypass_side == "left":
+        side = 1.0
+    elif args.ghost_obstacle_bypass_side == "right":
+        side = -1.0
+    elif abs(bearing_gap) > math.radians(8.0):
+        side = 1.0 if bearing_gap > 0.0 else -1.0
+    elif abs(obs_left) > 0.05:
+        # If the rock is already on one side of the camera, pass on the other side.
+        side = -1.0 if obs_left > 0.0 else 1.0
+    else:
+        side = 1.0 if goal_bearing >= 0.0 else -1.0
+
+    clearance = max(
+        float(args.ghost_obstacle_bypass_clearance),
+        float(args.ghost_obstacle_world_radius) + float(args.robot_radius) + float(args.safety_margin) + 0.45,
+    )
+    target_forward = max(obs_forward, 0.45)
+    target_left = obs_left + side * clearance
+    target_bearing = math.atan2(target_left, max(target_forward, 1e-6))
+    yaw_cmd = float(np.clip(
+        float(args.ghost_obstacle_bypass_kp) * target_bearing,
+        -float(max_yaw_rate),
+        float(max_yaw_rate),
+    ))
+    turn_scale = max(0.35, 1.0 - min(abs(target_bearing), 1.2) / 1.6)
+    fwd = min(float(max_forward_speed), float(args.ghost_obstacle_bypass_forward) * turn_scale)
+    return True, np.asarray([fwd, 0.0, yaw_cmd], dtype=np.float32)
 def planar_goal_bearing(position: np.ndarray, yaw: float, goal: np.ndarray) -> float:
     dx = float(goal[0] - position[0])
     dz = float(goal[2] - position[2])

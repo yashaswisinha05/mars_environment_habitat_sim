@@ -337,10 +337,12 @@ def main() -> None:
         f"--scene {Path(result['out_obj']).name} --terrain-obj marsyard2022.obj "
         f"--goal-x {args.goal_x:g} --goal-z {args.goal_z:g} "
         f"--ghost-obstacle-x {args.obstacle_x:g} --ghost-obstacle-z {args.obstacle_z:g} "
+        f"--ghost-obstacle-world-radius {args.obstacle_radius:g} "
         "--habitat-use-obstacle-channel --sample-steps 30 --action-smoothing ensemble "
         "--scene-height-flip-z --clearance 1.4 --pose-terrain-radius 0.8 "
         "--goal-height 1.2 --goal-terrain-radius 0.8 --lost-goal-ghost "
-        "--cbf --cbf-mode cone --zero-lateral --cbf-metric mahalanobis "
+        "--ghost-obstacle-bypass --ghost-obstacle-bypass-clearance 1.8 "
+        "--cbf --cbf-active-range 6.0 --cbf-mode cone --zero-lateral --cbf-metric mahalanobis "
         "--cbf-cov-mode shrink --cbf-radius-mode perceived --robot-radius 0.25 "
         "--safety-margin 0.15 --cbf-proj-iters 40 --cbf-keep-speed 1.0"
     )
