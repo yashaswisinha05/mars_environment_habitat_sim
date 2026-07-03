@@ -186,6 +186,42 @@ class TerrainHeight:
         return float(h0 * (1.0 - tz) + h1 * tz)
 
 
+class SceneMappedTerrain:
+    def __init__(self, base, *, flip_x: bool, flip_z: bool, swap_xz: bool):
+        self.base = base
+        self.mode = getattr(base, "mode", "unknown")
+        self.flip_x = bool(flip_x)
+        self.flip_z = bool(flip_z)
+        self.swap_xz = bool(swap_xz)
+
+    def _map(self, x: float, z: float) -> Tuple[float, float]:
+        xx = float(x)
+        zz = float(z)
+        if self.swap_xz:
+            xx, zz = zz, xx
+        if self.flip_x:
+            xx = -xx
+        if self.flip_z:
+            zz = -zz
+        return xx, zz
+
+    def __call__(self, x: float, z: float) -> float:
+        xx, zz = self._map(x, z)
+        return float(self.base(xx, zz))
+
+    def local_height_max(self, x: float, z: float, radius: float, samples: int = 5) -> float:
+        radius = max(float(radius), 0.0)
+        samples = max(int(samples), 1)
+        if radius <= 1e-6 or samples == 1:
+            return float(self(x, z))
+        vals = []
+        for dx in np.linspace(-radius, radius, samples):
+            for dz in np.linspace(-radius, radius, samples):
+                if dx * dx + dz * dz <= radius * radius + 1e-8:
+                    vals.append(float(self(float(x) + float(dx), float(z) + float(dz))))
+        return float(max(vals)) if vals else float(self(x, z))
+
+
 def bilinear_grid(grid: np.ndarray, px: float, py: float) -> float:
     h, w = grid.shape
     x0 = int(np.floor(px))
@@ -445,20 +481,25 @@ def main() -> None:
     ap.add_argument("--goal-x", type=float, required=True)
     ap.add_argument("--goal-z", type=float, required=True)
     ap.add_argument("--goal-y", type=float, default=None, help="World Y of goal marker; default terrain height + goal-height")
-    ap.add_argument("--goal-height", type=float, default=0.6, help="Goal marker height above terrain when --goal-y is omitted")
+    ap.add_argument("--goal-height", type=float, default=1.2, help="Goal marker height above terrain when --goal-y is omitted")
+    ap.add_argument("--goal-terrain-radius", type=float, default=0.8, help="Raise ghost goal from local max terrain height in this radius")
     ap.add_argument("--goal-radius", type=int, default=18)
     ap.add_argument("--no-clamp-goal-to-edge", action="store_true")
     ap.add_argument("--terrain-height-mode", choices=["auto", "heightmap", "obj", "flat"], default="auto")
     ap.add_argument("--heightmap", default=None)
     ap.add_argument("--terrain-obj", default=str(DEFAULT_OBJ))
     ap.add_argument("--flat-y", type=float, default=0.0)
-    ap.add_argument("--clearance", type=float, default=0.9)
+    ap.add_argument("--clearance", type=float, default=1.4)
+    ap.add_argument("--pose-terrain-radius", type=float, default=0.8, help="Use local max terrain height around rover footprint before adding clearance")
     ap.add_argument("--size-x", type=float, default=SIZE_X)
     ap.add_argument("--size-z", type=float, default=SIZE_Z)
     ap.add_argument("--size-y", type=float, default=SIZE_Y)
     ap.add_argument("--flip-heightmap-x", action="store_true")
     ap.add_argument("--flip-heightmap-z", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--swap-heightmap-xz", action="store_true")
+    ap.add_argument("--scene-height-flip-x", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--scene-height-flip-z", action=argparse.BooleanOptionalAction, default=True, help="Mirror Habitat scene Z before terrain-height lookup; matches the Mars GLB export")
+    ap.add_argument("--scene-height-swap-xz", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--habitat-proprio-mode", choices=["pose7", "planar3", "zero"], default=None)
     ap.add_argument("--habitat-action-mode", choices=["action3d", "action2d", "waypoint"], default=None)
     ap.add_argument("--habitat-yaw-axis", choices=["x", "y", "z"], default=None)
@@ -526,7 +567,7 @@ def main() -> None:
     frame_dir = out_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
 
-    terrain = TerrainHeight(
+    raw_terrain = TerrainHeight(
         mode=args.terrain_height_mode,
         heightmap=Path(args.heightmap).expanduser().resolve() if args.heightmap else None,
         obj=Path(args.terrain_obj).expanduser().resolve() if args.terrain_obj else None,
@@ -537,6 +578,12 @@ def main() -> None:
         flip_x=args.flip_heightmap_x,
         flip_z=args.flip_heightmap_z,
         swap_xz=args.swap_heightmap_xz,
+    )
+    terrain = SceneMappedTerrain(
+        raw_terrain,
+        flip_x=bool(args.scene_height_flip_x),
+        flip_z=bool(args.scene_height_flip_z),
+        swap_xz=bool(args.scene_height_swap_xz),
     )
 
     device = args.device
@@ -559,7 +606,7 @@ def main() -> None:
     dt = 1.0 / float(args.hz)
     goal_y = args.goal_y
     if goal_y is None:
-        goal_y = terrain(float(args.goal_x), float(args.goal_z)) + float(args.goal_height)
+        goal_y = terrain.local_height_max(float(args.goal_x), float(args.goal_z), float(args.goal_terrain_radius)) + float(args.goal_height)
     goal = np.asarray([float(args.goal_x), float(goal_y), float(args.goal_z)], dtype=np.float32)
 
     ghost_obstacle = None
@@ -568,7 +615,7 @@ def main() -> None:
     if args.ghost_obstacle_x is not None and args.ghost_obstacle_z is not None:
         obstacle_y = args.ghost_obstacle_y
         if obstacle_y is None:
-            obstacle_y = terrain(float(args.ghost_obstacle_x), float(args.ghost_obstacle_z)) + float(args.ghost_obstacle_height)
+            obstacle_y = terrain.local_height_max(float(args.ghost_obstacle_x), float(args.ghost_obstacle_z), float(args.pose_terrain_radius)) + float(args.ghost_obstacle_height)
         ghost_obstacle = np.asarray(
             [float(args.ghost_obstacle_x), float(obstacle_y), float(args.ghost_obstacle_z)],
             dtype=np.float32,
@@ -590,7 +637,11 @@ def main() -> None:
     print(f"  navdp_root : {navdp_root}", flush=True)
     print(f"  scene      : {Path(args.scene).expanduser().resolve()}", flush=True)
     print(f"  ckpt       : {Path(args.ckpt).expanduser().resolve()}", flush=True)
-    print(f"  terrain    : {terrain.mode}", flush=True)
+    print(
+        f"  terrain    : {terrain.mode} scene_flip_x={args.scene_height_flip_x} "
+        f"scene_flip_z={args.scene_height_flip_z} scene_swap_xz={args.scene_height_swap_xz}",
+        flush=True,
+    )
     print(f"  goal       : x={goal[0]:.2f} y={goal[1]:.2f} z={goal[2]:.2f}", flush=True)
     if args.scene_mode != "mars" or args.obstacle_pool != "none" or args.episodes_per_category != 1:
         print(
@@ -613,7 +664,7 @@ def main() -> None:
 
     try:
         for step in range(int(args.max_steps)):
-            y = terrain(x, z) + float(args.clearance)
+            y = terrain.local_height_max(x, z, float(args.pose_terrain_radius)) + float(args.clearance)
             position = np.asarray([x, y, z], dtype=np.float32)
             set_agent_pose(agent, x, y, z, yaw)
             obs = sim.get_sensor_observations()
@@ -859,6 +910,13 @@ def main() -> None:
         "ckpt": str(Path(args.ckpt).expanduser().resolve()),
         "scene": str(Path(args.scene).expanduser().resolve()),
         "terrain_mode": terrain.mode,
+        "scene_height_flip_x": bool(args.scene_height_flip_x),
+        "scene_height_flip_z": bool(args.scene_height_flip_z),
+        "scene_height_swap_xz": bool(args.scene_height_swap_xz),
+        "clearance": float(args.clearance),
+        "pose_terrain_radius": float(args.pose_terrain_radius),
+        "goal_height": float(args.goal_height),
+        "goal_terrain_radius": float(args.goal_terrain_radius),
         "replan_every": replan_every,
         "cbf_active": cbf_active,
         "cbf_metric": args.cbf_metric,
